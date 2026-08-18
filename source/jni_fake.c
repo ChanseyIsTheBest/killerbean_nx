@@ -167,18 +167,102 @@ static void *reg_local(void *ref) {
  * identity comparisons and per-object state all collapse, silently. */
 #define MAX_ISTR 2048
 static FakeString istr_pool[MAX_ISTR];
+/* Moved up from its old home beside jni_make_object (round 166): free_ref()
+ * has to be able to see it, and it could not. See ref_is_pooled(). */
+#define MAX_IOBJ 512
+static FakeObject iobj_pool[MAX_IOBJ];
+static int iobj_count = 0;
 static int istr_count = 0;
+
+/* ---- retired-reference quarantine (round 165) ----------------------------
+ *
+ * Every crash in this family has the same shape: the engine keeps using a JNI
+ * reference after we freed it, and the free returns the block to the allocator,
+ * where KB_POISON_FREED fills it with 0xDE. A read then produces a poisoned
+ * POINTER, and dereferencing that is a hard fault. The site has moved four
+ * times now -- methodID, then the receiver, then an array's items buffer, then
+ * the array struct itself -- because each fix guarded one place while the cause
+ * stayed put. Guarding the next site would just move it again.
+ *
+ * So: do not hand the STRUCT back to the allocator immediately. Retire it into
+ * a small ring and free it only once N more have been retired. The struct stays
+ * mapped and readable with tag == 0, so nx_tag_of() reports "not ours" and
+ * every existing guard takes its safe branch instead of faulting. The payload
+ * (items / utf / data) is still freed at once and its pointer NULLed first, so
+ * nothing large is retained.
+ *
+ * Cost is bounded: KB_REF_QUARANTINE structs, the largest of which is
+ * FakeObject at 68 bytes (a 64-byte label), so 512 is under 35 KB.
+ * This does NOT make the use-after-free correct -- the engine still reads a
+ * dead reference and now gets a clean "not ours" answer instead of a crash.
+ * It converts a fatal race into a wrong-but-survivable one, and the counter
+ * below says how often that happens. */
+#if KB_REF_QUARANTINE
+static void  *g_retired[KB_REF_QUARANTINE];
+static int    g_retired_w = 0;
+static Mutex  g_retired_lk;
+static unsigned g_retired_n = 0;
+
+static void ref_retire(void *p) {
+  mutexLock(&g_retired_lk);
+  void *evict = g_retired[g_retired_w];
+  g_retired[g_retired_w] = p;
+  g_retired_w = (g_retired_w + 1) % KB_REF_QUARANTINE;
+  g_retired_n++;
+  mutexUnlock(&g_retired_lk);
+  if (evict) free(evict);          /* outside the lock: free() takes its own */
+}
+unsigned nx_jni_retired(void) { return g_retired_n; }
+#else
+static void ref_retire(void *p) { free(p); }
+unsigned nx_jni_retired(void) { return 0; }
+#endif
+
+/* Any reference that lives in static storage: interned, shared, never freed. */
+static inline int ref_is_pooled(const void *r) {
+  const char *p = (const char *)r;
+  return (p >= (const char *)istr_pool && p < (const char *)&istr_pool[MAX_ISTR]) ||
+         (p >= (const char *)iobj_pool && p < (const char *)&iobj_pool[MAX_IOBJ]);
+}
 
 static void free_ref(void *ref) {
   if (!ref)
     return;
-  if ((char *)ref >= (char *)istr_pool && (char *)ref < (char *)&istr_pool[MAX_ISTR])
-    return;  // interned string -- pooled, never freed
+  /* ROUND 166. Pooled references are INTERNED AND SHARED. They are static
+   * storage, they are handed to the engine many times over, and they must never
+   * be freed, retired, or have their tag cleared.
+   *
+   * istr_pool was already excluded here. iobj_pool was not -- and it could not
+   * be, because it was declared 50 lines further down than this function. That
+   * omission was invisible while free_ref() merely called free() on a static
+   * address (the allocator rejects those), but round 164 added a tag-clear
+   * before the free, and clearing the tag of a SHARED object kills it for every
+   * other holder: nx_tag_of() then reports "not ours" for the rest of the
+   * session and every guard silently takes its wrong branch. That is where the
+   * eight "[jni] dead receiver ... on .longValue" lines in the last log came
+   * from -- self-inflicted, by the previous fix.
+   *
+   * One predicate for every pool, so the next one added cannot be missed. */
+  if (ref_is_pooled(ref)) return;
   switch (nx_tag_of(ref)) {
-    case TAG_STRING: { FakeString *s = ref; free(s->utf); free(s); break; }
-    case TAG_PRIARR: { FakePriArray *a = ref; free(a->data); free(a); break; }
-    case TAG_OBJARR: { FakeObjArray *a = ref; free(a->items); free(a); break; }
-    case TAG_OBJECT: free(ref); break;
+    /* Clear the tag and the inner pointer BEFORE freeing either.
+     *
+     * Round 164: a live-looking FakeObjArray with a poisoned items buffer
+     * faulted j_GetObjectArrayElement. Freeing the payload first and the struct
+     * second leaves a window in which the struct still reads TAG_OBJARR while
+     * its buffer is already poison -- and if the struct's block is then reused
+     * or the second free is skipped, that window never closes. Zeroing first
+     * costs two stores and makes the half-freed state impossible: the tag stops
+     * matching, so every nx_tag_of() caller takes its "not ours" branch instead
+     * of indexing freed memory. */
+    case TAG_STRING: { FakeString *s = ref; char *u = s->utf;
+                       s->tag = 0; s->utf = NULL; free(u); ref_retire(s); break; }
+    case TAG_PRIARR: { FakePriArray *a = ref; void *d = a->data;
+                       a->tag = 0; a->data = NULL; free(d); ref_retire(a); break; }
+    case TAG_OBJARR: { FakeObjArray *a = ref; void **it = a->items;
+                       a->tag = 0; a->items = NULL; a->len = 0;
+                       free(it); ref_retire(a); break; }
+    case TAG_OBJECT: { *(volatile uint32_t *)ref = 0; ref_retire(ref); break; }
     case BITMAP_TAG: text2bitmap_free((FakeBitmap *)ref); break;
     default: break; // TAG_ID / TAG_CLASS are pooled
   }
@@ -206,9 +290,6 @@ static void delete_local(void *ref) {
 // leaves it alone, never reg_local'd) -- so the engine's frequent NewObject calls
 // don't fill the local-ref table. Safe: our objects are opaque, stateless handles
 // dispatched by method class, not by identity.
-#define MAX_IOBJ 512
-static FakeObject iobj_pool[MAX_IOBJ];
-static int iobj_count = 0;
 void *jni_make_object(const char *label) {
   const char *l = (label && label[0]) ? label : "obj";
   mutexLock(&locals_lock);
@@ -475,7 +556,68 @@ static int sig_returns(const char *sig, const char *ret) {
   return rp && strstr(rp + 1, ret) == rp + 1;
 }
 
-static int name_has(const char *name, const char *sub) { return strstr(name, sub) != NULL; }
+/* ROUND 161. NULL-safe. Every dispatcher's first act is a name_has() on
+ * id->name, so a methodID with no name reached strstr(NULL, ...) and faulted --
+ * see id_usable() below for the crash this comes from. Returning 0 here means
+ * an unnamed method simply matches nothing and falls to the catch-all, which is
+ * the behaviour every caller already expects. */
+static int name_has(const char *name, const char *sub) {
+  return name && strstr(name, sub) != NULL;
+}
+
+/* Is this jmethodID one of OURS?
+ *
+ * Four identical crash reports from a release build (DEBUG_LOG 0, so no
+ * debug.log) all landed here:
+ *
+ *   PC      svcBreak                        <- libnx handler finishing up
+ *   LR      __libnx_exception_handler+0x440
+ *   RA[00]  __libnx_exception_returnentry+4
+ *   RA[01]  j_CallLongMethodV+0x20          <- the real frame
+ *   RA[02]  libunity+0xa6c3a8               <- blr x8 on env->fn[0x1a8]
+ *   RA[03]  _EntryWrap+0xa8
+ *
+ * libunity+0xa6c3a4 is `blr x8` on the JNI table entry at byte offset 0x1a8 --
+ * CallLongMethodV -- and j_CallLongMethodV+0x1c is the call into
+ * dispatch_long(), whose very first line dereferenced id->name.
+ *
+ * So the engine called a long-returning method with a methodID we never
+ * validated. Whether it is NULL or stale, dereferencing it is a hard fault in a
+ * release build with nothing written to disk. A fake JNI cannot afford that:
+ * an unrecognised methodID is a wrong ANSWER at worst, never a dead console.
+ *
+ * TAG_ID is the same magic the crash dump decoder and proxy_invoke already
+ * check, so this costs one load and one compare. */
+/* Could `p` be a live pointer at all? Value-only: alignment and a floor, never
+ * a dereference. This is what makes it safe to run on a reference we already
+ * suspect.
+ *
+ * KB_POISON_FREED fills freed blocks with 0xDE, so a pointer read back out of
+ * one is 0xdededededededede -- and 0xde & 7 == 6, so the alignment test alone
+ * rejects every poisoned pointer without touching it. That is the whole reason
+ * the poison is worth its memset: it turns use-after-free from "reads whatever
+ * is there now" into something detectable with two instructions. */
+static inline int ptr_plausible(const void *p) {
+  uintptr_t v = (uintptr_t)p;
+  /* 4, NOT 8 -- the same rule nx_tag_of() uses, and for the same reason.
+   * FakeID is 324 bytes and FakeClass is 100, both pooled in arrays, so every
+   * odd-indexed entry lands on a 4-aligned address. Demanding 8 here (as the
+   * first draft of this did) rejects half of every pooled class and method
+   * reference: GetObjectArrayElement would hand back NULL for the Class[] that
+   * newInterfaceProxy reads, and dispatch_long would refuse a pooled receiver.
+   * 4 still rejects the poison -- 0xde & 3 == 2 -- which is all this needs. */
+  return p && !(v & 3u) && v >= 0x1000u;
+}
+
+static int id_usable(const FakeID *id) {
+  if (id && nx_tag_of((void *)id) == TAG_ID) return 1;
+  { static unsigned n = 0;
+    if (n++ < 16)
+      debugPrintf("[jni] *** bad methodID %p (tag=%08x) -- answering the "
+                  "default instead of dereferencing it ***\n",
+                  (void *)id, id ? nx_tag_of((void *)id) : 0u); }
+  return 0;
+}
 
 // --- Text2Bitmap ------------------------------------------------------------
 // draw methods return a Bitmap; the first arg is the text String, the next int
@@ -1476,6 +1618,7 @@ static int32_t g_req_orientation = 0;   /* SCREEN_ORIENTATION_LANDSCAPE == 0 */
 static int32_t g_sys_ui_vis      = 0;   /* SYSTEM_UI_FLAG_VISIBLE == 0       */
 
 static juint act_int(const FakeID *id, va_list va) {
+  if (!id_usable(id)) return 0;
   if (name_has(id->cls, "Handler") && name_has(id->name, "post")) {   /* post/postDelayed(Runnable) */
     post_runnable(va_arg(va, void *)); return 1;
   }
@@ -1791,6 +1934,7 @@ static void log_app_upcall(const FakeID *id) {
 }
 
 static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
+  if (!id_usable(id)) return NULL;
   jni_approx_arm();
   log_app_upcall(id);
   /* ---- fluent builders (round 152) ---------------------------------------
@@ -2001,6 +2145,7 @@ static void *dispatch_object(void *recv, const FakeID *id, va_list va) {
   return (is_t2b(id->cls) || wants_bitmap) ? t2b_object(id, va) : act_object(id, va);
 }
 static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
+  if (!id_usable(id)) return 0;
   jni_approx_arm();
   log_app_upcall(id);
   // java.lang.String instance methods reached via CallIntMethod (Unity's
@@ -2085,6 +2230,7 @@ static juint dispatch_int(void *recv, const FakeID *id, va_list va) {
   return act_int(id, va);
 }
 static float dispatch_float(void *recv, const FakeID *id, va_list va) {
+  if (!id_usable(id)) return 0.0f;
   jni_approx_arm();
   if (unity_is_boxed(recv)) return unity_boxed_float(recv);   /* Float.floatValue */
   if (input_owns_recv(recv)) return input_dispatch_float(recv, id, va);
@@ -2092,6 +2238,7 @@ static float dispatch_float(void *recv, const FakeID *id, va_list va) {
   return act_float(id, va);
 }
 static void dispatch_void(void *recv, const FakeID *id, va_list va) {
+  if (!id_usable(id)) return;
   jni_approx_arm();
   log_app_upcall(id);
   if (name_has(id->cls, "FMODAudioDevice")) {
@@ -2246,6 +2393,7 @@ static void *j_PopLocalFrame(void *env, void *result) {
     (void)env; return dispatch(recv, id, va); }
 
 static uint64_t dispatch_long(void *recv, const FakeID *id, va_list va) {
+  if (!id_usable(id)) return 0;
   if (name_has(id->name, "nanoTime")) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -2253,6 +2401,20 @@ static uint64_t dispatch_long(void *recv, const FakeID *id, va_list va) {
   if (name_has(id->name, "currentTimeMillis")) {
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+  }
+  /* recv is a jobject the engine handed back, and it can be stale:
+   *
+   *   [xd] pc=unity_is_boxed+0x4  lr=dispatch_long+0xd0  x0=dededededededede
+   *
+   * unity_is_boxed() dereferences it. Round 161's id_usable() guarded the
+   * methodID, which is why "bad methodID" never appeared in the log -- the ID
+   * was always fine and the RECEIVER was the dangling one. */
+  if (recv && !ptr_plausible(recv)) {
+    static unsigned n = 0;
+    if (n++ < 8)
+      debugPrintf("[jni] dead receiver %p on .%s -- answering the default\n",
+                  recv, id->name);
+    return 0;
   }
   if (!unity_is_boxed(recv) && name_has(id->name, "longValue")) return g_frame_ns;
   return (uint64_t)dispatch_int(recv, id, va);
@@ -2558,15 +2720,57 @@ void *jni_new_object_array(int len, void *fill) {
   return j_NewObjectArray(NULL, len, NULL, fill);
 }
 
+/* ROUND 164. The tag check is not enough on its own.
+ *
+ *   [xd] pc=j_GetObjectArrayElement+0x154  far=dededededededede
+ *   +0x150  ldr x0, [x1, #8]            ; a->items
+ *   +0x154  ldr x0, [x0, w2, uxtw #3]   ; items[i]   <-- fault
+ *
+ * The FakeObjArray itself was fine -- tag read TAG_OBJARR and len was sane, so
+ * every existing check passed -- but its `items` buffer had been freed and
+ * poisoned underneath it. free_ref() releases items and the struct separately,
+ * so there is a window where one is gone and the other still looks valid.
+ * Check the buffer too, by value, before indexing it. */
+/* ROUND 165: validate the VALUE you are about to use, not the place it lives.
+ *
+ * Round 164 checked a->items inside objarr_ok() and then indexed a->items in
+ * the caller -- two separate loads of the same field. objarr_ok() is a real
+ * call, so the compiler cannot cache it, and the crash log shows the field
+ * changing between them:
+ *
+ *   +0x038  bl  objarr_ok.part.0        ; loads a->items, passes
+ *   +0x054  ldr x0, [x19, #8]           ; RE-loads it -> dededededededede
+ *   +0x058  ldr x0, [x0, w20, uxtw #3]  ; fault
+ *
+ * Another thread freed the array in that window. Checking harder in the same
+ * shape cannot fix that; the check has to hand back the pointer it approved so
+ * there is only ever one load. */
+static void **objarr_items(const FakeObjArray *a, int i) {
+  if (!a || nx_tag_of((void *)a) != TAG_OBJARR) return NULL;
+  void **it  = *(void ** volatile const *)&a->items;   /* exactly one load */
+  const int n = *(int volatile const *)&a->len;
+  if (i < 0 || i >= n) return NULL;
+  if (ptr_plausible(it)) return it;
+  { static unsigned w = 0;
+    if (w++ < 8)
+      debugPrintf("[jni] object array %p has a dead items buffer (%p, len=%d) "
+                  "-- freed underneath a live array\n", (const void *)a, (void *)it, n); }
+  return NULL;
+}
 static void *j_GetObjectArrayElement(void *env, void *arr, int i) {
   (void)env;
-  FakeObjArray *a = arr;
-  return (a && nx_tag_of(a) == TAG_OBJARR && i >= 0 && i < a->len) ? a->items[i] : NULL;
+  void **it = objarr_items(arr, i);
+  if (!it) return NULL;
+  /* And do not hand a poisoned WORD back as a jobject either: the element can
+   * be stale even when the buffer is live, and a bad ref returned here just
+   * faults somewhere less obvious later. */
+  void *v = it[i];
+  return ptr_plausible(v) ? v : NULL;
 }
 static void j_SetObjectArrayElement(void *env, void *arr, int i, void *val) {
   (void)env;
-  FakeObjArray *a = arr;
-  if (a && nx_tag_of(a) == TAG_OBJARR && i >= 0 && i < a->len) a->items[i] = val;
+  void **it = objarr_items(arr, i);
+  if (it) it[i] = val;
 }
 
 /* Round 145. Never return NULL from here.

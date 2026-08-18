@@ -19,7 +19,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET    := killerbean_nx
 APP_TITLE := Killer Bean Unleashed
 APP_AUTHOR := ChanseyIsTheBest
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 # No icon is shipped: the reference tree's icon.jpg was Fruit Ninja artwork and
 # is not ours to redistribute. Drop your own 256x256 JPEG in as icon.jpg and
 # uncomment the two lines below, or build without one (libnx uses a default).

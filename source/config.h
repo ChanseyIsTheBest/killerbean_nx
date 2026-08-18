@@ -211,7 +211,7 @@
  *
  * Note that 0 does NOT disable the watchdog thread: it is also the escape hatch
  * that undoes a wedged GC stop-the-world (round 101), so it always runs. */
-#define DEBUG_LOG 0   /* release build: no debug.log, no SD traffic. Set to 1
+#define DEBUG_LOG 1   /* release build: no debug.log, no SD traffic. Set to 1
                        * when investigating anything -- every diagnostic in this
                        * tree goes dark at 0, including the crash dump and the
                        * JNI approximation ledger. The watchdog still runs; it is
@@ -371,6 +371,22 @@
  * file is generated commented-out: nothing is unlocked until the player says
  * so. See source/kb_purchases.c. */
 #define KB_OFFLINE_PURCHASES 1
+
+/* Round 162: refuse to overwrite a non-empty save value with an empty one.
+ * A game that writes "" over real progress has had a READ fail, and persisting
+ * that turns a transient failure into a permanent wipe. Keeps the last
+ * non-empty value and logs every block. Cost: an intentional in-game erase of a
+ * save slot may not stick. 0 restores plain last-write-wins. */
+#define KB_PROTECT_SAVES 1
+
+/* Round 165: how many freed JNI reference STRUCTS to keep mapped before
+ * actually returning them to the allocator. The engine uses references after
+ * deleting them; retiring the struct instead of freeing it means the stale read
+ * sees tag == 0 ("not one of ours") rather than 0xDE poison, so the guards
+ * answer safely instead of faulting. Structs only -- payloads are still freed
+ * immediately -- so 512 costs under 35 KB (FakeObject is the largest at 68 bytes). 0 disables it and frees
+ * immediately, which is the round-164 behaviour that crashed. */
+#define KB_REF_QUARANTINE 512
 
 /* Round 155 DIAGNOSTIC. Replace LevelMap_Control.PlayLevel()/Menu() with two
  * log lines to find out whether the map's uGUI clicks arrive at all. The bodies

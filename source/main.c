@@ -332,6 +332,13 @@ static void nx_clock_tick(void *tm) {
            * old code every one of those resumed the world and cost a sound
            * collection. slept counts the waits that would genuinely have
            * blocked; only those can now reach a bailout. */
+          /* Round 165: how many dead JNI refs the quarantine is holding off the
+           * allocator. A steadily climbing number means the engine really does
+           * use references after deleting them -- the quarantine is absorbing
+           * it, not hiding a leak (payloads are freed immediately). */
+          { extern unsigned nx_jni_retired(void);
+            const unsigned rt = nx_jni_retired();
+            if (rt) debugPrintf("[jni] retired refs: %u\n", rt); }
           { extern void nx_gc_futex_stats(unsigned *, unsigned *, unsigned *);
             extern void nx_gc_futex_wakers(void);
             unsigned fns = 0, fsl = 0, frs = 0;

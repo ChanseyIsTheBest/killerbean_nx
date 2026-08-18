@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <switch.h>   /* fsdevCommitDevice: nothing is durable without it */
 
 #include "asset_pack.h"
 #include "libc_shim.h"   /* nx_pack_relpath */
@@ -117,6 +118,31 @@ typedef struct { char type; char *key; char *val; } KV;
 static KV   *g_kv = NULL; static int g_kv_n=0, g_kv_cap=0; static int g_kv_dirty=0;
 
 static char *prefs_file(char *buf,size_t n){ snprintf(buf,n,"%s/prefs.kv",g_root); return buf; }
+static char *prefs_tmp (char *buf,size_t n){ snprintf(buf,n,"%s/prefs.kv.new",g_root); return buf; }
+static char *prefs_bak (char *buf,size_t n){ snprintf(buf,n,"%s/prefs.kv.bak",g_root); return buf; }
+
+/* The three keys that ARE the save. Narrowed from a negative list once a real
+ * prefs.kv could be read (round 163). That file holds 12 entries:
+ *
+ *   S  data          685 bytes   "5000,3,9,0,0,..."  progress
+ *   S  data_scores   403 bytes   best score per level
+ *   S  data_times    403 bytes   best time per level
+ *   S  my_data        12 bytes   "Hello World!"  -- a fixed sentinel
+ *   S  unity.player_sessionid / player_session_count / cloud_userid
+ *   I  __UNITY_PLAYERPREFS_VERSION__, Screenmanager x3, button_size
+ *
+ * which matches Stuff.CreateCloudFile_data / _data_scores / _data_times in the
+ * IL2CPP dump. Everything else is Unity bookkeeping, a user setting, or a
+ * sentinel, and none of it is worth refusing a write for.
+ *
+ * Size is the tell if you ever need to eyeball a prefs.kv: a healthy one is
+ * ~1.8 KB, of which 1491 bytes are these three values. Around 350 bytes means
+ * twelve keys with empty values -- a wipe that kept its shape. */
+static int is_save_key(const char *k) {
+  if (!k) return 0;
+  return !strcmp(k, "data") || !strcmp(k, "data_scores") ||
+         !strcmp(k, "data_times");
+}
 
 static void kv_set(char type,const char*key,const char*val){
   for (int i=0;i<g_kv_n;i++) if(!strcmp(g_kv[i].key,key)){
@@ -137,28 +163,117 @@ static void esc(FILE*f,const char*s){ for(;*s;s++){ if(*s=='\\'||*s=='\t'||*s=='
 static char *unesc(char*s){ char*o=s,*w=s; for(;*o;o++){ if(*o=='\\'&&o[1]){o++;
   *w++=(*o=='t')?'\t':(*o=='n')?'\n':*o;} else *w++=*o;} *w=0; return s; }
 
-static void prefs_load(void){
-  char p[256]; FILE*f=fopen(prefs_file(p,sizeof p),"rb");
-  if(!f){ debugPrintf("[prefs] load: no save file at %s (errno=%d)\n", p, errno); return; }
-  char line[2048];
+/* Parse one file into the KV table. Returns entries read, or -1 if unopenable.
+ * Split out of prefs_load so the backup can be tried with identical code. */
+static int prefs_read_file(const char *path){
+  FILE *f = fopen(path, "rb");
+  if(!f) return -1;
+  /* 8 KB, and truncation is FATAL rather than ignored.
+   *
+   * The old buffer was 2048 and the real save is already 1843 bytes total with
+   * a single 685-byte value -- one line of ~695 bytes. That is far less
+   * headroom than it looks: `data` is a comma-separated array that grows with
+   * the level count, and fgets() on an over-long line does not fail, it splits
+   * it. The tail would then be parsed as a fresh "type\tkey\tvalue" record,
+   * quietly inserting a garbage key and truncating the real save -- corruption
+   * that looks like a successful load. Treat it as corrupt so the caller falls
+   * back to the backup instead. */
+  char line[8192];
   while (fgets(line,sizeof line,f)){
-    char *nl=strchr(line,'\n'); if(nl)*nl=0;
+    char *nl=strchr(line,'\n');
+    if(!nl && !feof(f)){
+      debugPrintf("[prefs] load: line longer than %u bytes in %s -- refusing to "
+                  "parse a split record\n", (unsigned)sizeof line, path);
+      fclose(f); kv_clear(); return -2;
+    }
+    if(nl)*nl=0;
     if(!line[0]) continue;
     char type=line[0]; char *k=line+2;            /* "T\tkey\tval"          */
     char *t1=strchr(k,'\t'); if(!t1) continue; *t1=0; char*v=t1+1;
     kv_set(type, unesc(k), unesc(v));
   }
-  fclose(f); g_kv_dirty=0;
-  debugPrintf("[prefs] load: %d entries from %s\n", g_kv_n, p);
+  fclose(f);
+  return g_kv_n;
 }
+
+/* ROUND 162: prefs.kv is the SAVE FILE, and it was being destroyed to write it.
+ *
+ * The old flush opened the live file with "wb", which truncates it to zero
+ * before the first byte is written, and never committed. So there were two
+ * windows in which a session's progress disappeared:
+ *
+ *   1. crash (or power off) between the truncate and the data reaching the
+ *      card -> prefs.kv is empty or half a line long. This port does crash --
+ *      both logs from the wiped run contain a fault -- so this is not
+ *      theoretical.
+ *   2. clean write, no crash, but fsdev buffers it in the FS service. fclose()
+ *      makes it visible to US; nothing is durable until the device is
+ *      committed. The log cheerfully said "wrote 11 entries" either way.
+ *
+ * Now: write prefs.kv.new, commit it, keep the outgoing file as prefs.kv.bak,
+ * then rename into place and commit again. The live file is never in a
+ * half-written state -- at every instant either prefs.kv or prefs.kv.bak is a
+ * complete save. */
+static void prefs_load(void){
+  char p[256], b[256];
+  prefs_file(p,sizeof p); prefs_bak(b,sizeof b);
+  int n = prefs_read_file(p);
+  if (n > 0){ g_kv_dirty=0; debugPrintf("[prefs] load: %d entries from %s\n", n, p); return; }
+
+  /* Empty or unreadable. An EXISTING but empty prefs.kv is the signature of a
+   * crash during the old truncating write, so prefer the backup over starting
+   * a fresh save -- silently beginning again is how progress vanishes. */
+  debugPrintf("[prefs] load: %s %s -- trying %s\n", p,
+              n == -1 ? "missing" : n == -2 ? "CORRUPT" : "EMPTY (interrupted write?)", b);
+  kv_clear();
+  n = prefs_read_file(b);
+  if (n > 0){
+    g_kv_dirty=1;                 /* re-publish the backup as the live file */
+    debugPrintf("[prefs] load: RECOVERED %d entries from %s\n", n, b);
+    return;
+  }
+  kv_clear(); g_kv_dirty=0;
+  debugPrintf("[prefs] load: no usable save (fresh start)\n");
+}
+
 static void prefs_flush(void){
   if(!g_kv_dirty){ debugPrintf("[prefs] flush: nothing dirty (%d entries)\n", g_kv_n); return; }
-  char p[256]; FILE*f=fopen(prefs_file(p,sizeof p),"wb");
-  if(!f){ debugPrintf("[prefs] flush FAILED: fopen(%s,wb) errno=%d\n", p, errno); return; }
+  char p[256], t[256], b[256];
+  prefs_file(p,sizeof p); prefs_tmp(t,sizeof t); prefs_bak(b,sizeof b);
+
+  FILE*f=fopen(t,"wb");
+  if(!f){ debugPrintf("[prefs] flush FAILED: fopen(%s,wb) errno=%d\n", t, errno); return; }
   for(int i=0;i<g_kv_n;i++){ fputc(g_kv[i].type,f); fputc('\t',f);
     esc(f,g_kv[i].key); fputc('\t',f); esc(f,g_kv[i].val); fputc('\n',f); }
-  fclose(f); g_kv_dirty=0;
-  debugPrintf("[prefs] flush: wrote %d entries to %s\n", g_kv_n, p);
+  if (fflush(f) != 0 || ferror(f)){
+    debugPrintf("[prefs] flush FAILED: write error on %s errno=%d -- live save "
+                "left untouched\n", t, errno);
+    fclose(f); remove(t); return;
+  }
+  fclose(f);
+
+  /* Commit the NEW file before it replaces anything: a rename that beats its
+   * own data to the card would leave prefs.kv pointing at nothing. */
+  Result rc = fsdevCommitDevice("sdmc");
+  if (R_FAILED(rc)){
+    debugPrintf("[prefs] flush: commit of %s FAILED rc=0x%x -- not replacing "
+                "the live save\n", t, rc);
+    return;
+  }
+
+  remove(b);
+  rename(p, b);                       /* previous good save -> .bak (may fail
+                                       * on a first run; that is fine)       */
+  if (rename(t, p) != 0){
+    debugPrintf("[prefs] flush: rename(%s -> %s) FAILED errno=%d; the save is "
+                "intact in %s\n", t, p, errno, b);
+    rename(b, p);                     /* put the old one back                */
+    return;
+  }
+  rc = fsdevCommitDevice("sdmc");
+  g_kv_dirty=0;
+  debugPrintf("[prefs] flush: wrote %d entries to %s (%s)\n", g_kv_n, p,
+              R_SUCCEEDED(rc) ? "committed" : "COMMIT FAILED -- may not survive a reboot");
 }
 
 /* ==========================================================================
@@ -378,7 +493,34 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
     if (has(m,"putString")){ const char*k=jni_string_utf(va_arg(va,void*));
       const char*v=jni_string_utf(va_arg(va,void*));
       if(!k[0]){ debugPrintf("[prefs] putString SKIP empty key\n"); return recv; }
-      kv_set('S',k,v); debugPrintf("[prefs] putString '%s'\n", k); return recv; }
+#if KB_PROTECT_SAVES
+      /* An empty snapshot must not clobber a good one. If the game writes ""
+       * over a key that currently holds real data, its READ failed -- and
+       * persisting the result turns a transient read failure into a permanent
+       * wipe. Keep the last non-empty value and say so.
+       *
+       * This is a WORKAROUND, not a fix: the honest description is "keep the
+       * last non-empty value". The cost is that an intentional in-game erase
+       * of a save slot may not stick. Every block is logged, so it is never
+       * invisible; set KB_PROTECT_SAVES to 0 if erasing matters more. */
+      if ((!v || !v[0]) && is_save_key(k)) {
+        KV *old = kv_get(k);
+        if (old && old->val && old->val[0]) {
+          static unsigned blocked;
+          debugPrintf("[prefs] BLOCKED empty overwrite of '%s' (kept %u bytes) "
+                      "-- the read must have failed; block #%u this session\n",
+                      k, (unsigned)strlen(old->val), ++blocked);
+          return recv;
+        }
+      }
+#endif
+      kv_set('S',k,v);
+      /* Log the VALUE's size, not just the key. A key list cannot tell you
+       * whether a save contains anything -- 11 entries of "" looks identical
+       * to 11 entries of progress. */
+      debugPrintf("[prefs] putString '%s' = %u bytes%s\n", k,
+                  (unsigned)strlen(v ? v : ""), (v && v[0]) ? "" : " <EMPTY>");
+      return recv; }
     if (has(m,"putInt")){ const char*k=jni_string_utf(va_arg(va,void*));
       int v=va_arg(va,int); char b[32]; snprintf(b,sizeof b,"%d",v);
       if(!k[0]){ debugPrintf("[prefs] putInt SKIP empty key (=%d)\n",v); return recv; }
